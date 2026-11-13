@@ -16,6 +16,14 @@ from baseline.task_features import task_features, screen_task
 from baseline.input_estimator import InputEstimator
 from baseline.core import Budget, MODELS, StopRun, Trace, atomic_write, load_tasks, priority
 
+# A single proxy hiccup (HTTP 429/5xx, timeout, malformed body) or an unexpected
+# per-task error must not forfeit every remaining task. Such failures skip only
+# the current task; the run stops after this many consecutive ones. Budget and
+# wall-time stops remain immediate.
+TRANSIENT_STOP_PREFIXES = ('proxy_http_', 'proxy_transport_or_response_error', 'unsupported_proxy_response_schema')
+MAX_CONSECUTIVE_FAILURES = 3
+FAILURE_BACKOFF_SECONDS = 5
+
 
 def arguments():
     parser = argparse.ArgumentParser(description='openJiuwen competition baseline')
@@ -147,6 +155,7 @@ async def main(args):
             score=best['utility'] if best else task.reward/({'math':100,'search':200,'data_analysis':200,'coding':500}.get(task.task_type,500))
             return (-score,task.task_id)
         tasks.sort(key=rank)
+    failures = 0
     for task_index, task in enumerate(tasks):
         if args.resume and (task.directory/'answer.txt').is_file() and (task.directory/'answer.txt').read_text().strip():
             summary['tasks'].append({'task_id': task.task_id, 'status': 'existing_answer'})
@@ -172,6 +181,7 @@ async def main(args):
         start = time.monotonic()
         print(f'[{task.task_id}] start; spent={budget.spent:.1f}', flush=True)
         stop = False
+        transient = False
         try:
             budget.remaining_seconds()
             remaining=None if budget.limit is None else max(0,budget.limit-budget.spent)
@@ -199,11 +209,19 @@ async def main(args):
             result = await run_task(task, client, budget, trace, task_config)
         except StopRun as exc:
             result = {'status': 'stopped', 'reason': str(exc)}
-            stop = True
+            transient = str(exc).startswith(TRANSIENT_STOP_PREFIXES)
+            stop = not transient
         except Exception as exc:
             result = {'status': 'error', 'reason': f'{type(exc).__name__}: {exc}'}
-            # Unexpected infrastructure/framework errors should not repeat for every task.
-            stop = True
+            # Unexpected infrastructure/framework errors should not repeat for every
+            # task: tolerated per task, but bounded by MAX_CONSECUTIVE_FAILURES.
+            transient = True
+        if transient:
+            failures += 1
+            if failures >= MAX_CONSECUTIVE_FAILURES:
+                stop = True
+        else:
+            failures = 0
         record = {'settings':settings(task_config),'task_id': task.task_id, 'model':task_config.model, 'context_mode':task_config.context_mode, 'selection_fallback':decision['fallback'] if decision else None, 'reward': task.reward, **result,
                   'cost': budget.spent-before, 'seconds': time.monotonic()-start}
         trace.emit('task_end', **record)
@@ -214,6 +232,11 @@ async def main(args):
         if stop:
             summary['status'] = 'stopped'
             break
+        if transient:
+            trace.emit('task_failure_continue', task_id=task.task_id, consecutive=failures, reason=result['reason'])
+            delay = min(FAILURE_BACKOFF_SECONDS * failures, budget.deadline - time.monotonic() - 1)
+            if delay > 0:
+                await asyncio.sleep(delay)
     if summary['status'] == 'running':
         summary['status'] = 'finished'
     atomic_write(output, json.dumps(summary, ensure_ascii=False, indent=2))

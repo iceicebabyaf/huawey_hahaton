@@ -231,6 +231,56 @@ class ScriptTests(unittest.TestCase):
             self.assertEqual(summary['tasks'][0]['status'], 'submitted')
             self.assertNotIn('test-private-key', ''.join(p.read_text() for p in (root/'tasks'/'.baseline').glob('*.jsonl')))
 
+    def _proxy_failure_run(self, task_rewards, failing_calls):
+        import run_agent
+        import urllib.error
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        for task_id, reward in task_rewards.items():
+            task = root/'tasks'/task_id
+            task.mkdir(parents=True)
+            (task/'task.json').write_text(json.dumps({'task_id': task_id, 'task_type': 'math',
+                'instruction': 'Compute 6*7', 'reward': reward}))
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, limit):
+                return json.dumps({'choices': [{'message': {'content': '{"action":{"action":"final","answer":"42"}}'}}],
+                    'usage': {'prompt_tokens': 100, 'completion_tokens': 20}}).encode()
+        calls = []
+        def urlopen(request, timeout=None):
+            calls.append(1)
+            if len(calls) <= failing_calls:
+                raise urllib.error.HTTPError('https://example.invalid', 502, 'Bad Gateway', {}, None)
+            return Response()
+        with patch.object(sys, 'argv', ['run_agent.py', '--tasks-dir', str(root/'tasks'), '--out', str(root/'summary.json')]):
+            args = run_agent.arguments()
+        with patch.dict(os.environ, {'LLM_BASE_URL': 'https://example.invalid/v1', 'LLM_API_KEY': 'k'}), \
+             patch.object(run_agent, 'FAILURE_BACKOFF_SECONDS', 0), \
+             patch('urllib.request.urlopen', side_effect=urlopen):
+            code = asyncio.run(run_agent.main(args))
+        return code, root, json.loads((root/'summary.json').read_text())
+
+    @unittest.skipUnless(importlib.util.find_spec('openjiuwen'), 'openJiuwen not installed')
+    def test_single_proxy_error_skips_only_that_task(self):
+        code, root, summary = self._proxy_failure_run({'first': 5, 'second': 1}, failing_calls=1)
+        self.assertEqual(code, 0)
+        self.assertEqual(summary['status'], 'finished')
+        self.assertEqual([t['status'] for t in summary['tasks']], ['stopped', 'submitted'])
+        self.assertFalse((root/'tasks'/'first'/'answer.txt').exists())
+        self.assertEqual((root/'tasks'/'second'/'answer.txt').read_text(), '42\n')
+
+    @unittest.skipUnless(importlib.util.find_spec('openjiuwen'), 'openJiuwen not installed')
+    def test_consecutive_proxy_errors_stop_run(self):
+        import run_agent
+        rewards = {f't{i}': 10-i for i in range(run_agent.MAX_CONSECUTIVE_FAILURES+2)}
+        code, root, summary = self._proxy_failure_run(rewards, failing_calls=100)
+        self.assertEqual(code, 2)
+        self.assertEqual(summary['status'], 'stopped')
+        self.assertEqual(len(summary['tasks']), run_agent.MAX_CONSECUTIVE_FAILURES)
+        self.assertTrue(all(t['status'] == 'stopped' for t in summary['tasks']))
+
     def test_prepare_hides_answers_and_cli_reads_tasks(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory)/'tasks'
